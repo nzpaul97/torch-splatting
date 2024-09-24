@@ -76,6 +76,11 @@ class GSSTrainer(Trainer):
 
 
 if __name__ == "__main__":
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
+
+    iter_start.record()
+
     device = 'cuda'
     folder = './B075X65R3X'
     data = read_all(folder, resize_factor=0.5)
@@ -108,3 +113,7 @@ if __name__ == "__main__":
 
     trainer.on_evaluate_step()
     trainer.train()
+
+    iter_end.record()
+
+    print(iter_start.elapsed_time(iter_end))

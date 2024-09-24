@@ -2,10 +2,21 @@ import torch
 import torch.nn  as nn
 import numpy as np
 import math
-from simple_knn._C import distCUDA2
+# from simple_knn._C import distCUDA2
 from gaussian_splatting.utils.point_utils import PointCloud
 from gaussian_splatting.gauss_render import strip_symmetric, inverse_sigmoid, build_scaling_rotation
 from gaussian_splatting.utils.sh_utils import RGB2SH
+from scipy.spatial import KDTree
+import torch
+
+
+def distCUDA2(points):
+    points_np = points.detach().cpu().float().numpy()
+    dists, inds = KDTree(points_np).query(points_np, k=4)
+    meanDists = (dists[:, 1:] ** 2).mean(1)
+
+    return torch.tensor(meanDists, dtype=points.dtype, device=points.device)
+
 
 class GaussModel(nn.Module):
     """
