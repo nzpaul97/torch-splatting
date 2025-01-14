@@ -5,6 +5,12 @@ from torch.optim import Adam
 from pathlib import Path
 import os
 from tqdm import tqdm
+import habana_frameworks.torch.core as htcore
+import habana_frameworks.torch.gpu_migration
+from torch.profiler import profile, ProfilerActivity, record_function
+import contextlib
+
+USE_PROFILE = True
 
 def exists(x):
     return x is not None
@@ -58,7 +64,7 @@ class Trainer(object):
             log_with="all",
         )
 
-        self.accelerator.native_amp = amp
+        # self.accelerator.native_amp = amp
 
         self.model = model
         self.sampler = sampler
@@ -76,54 +82,57 @@ class Trainer(object):
 
         self.opt = Adam(self.model.parameters(), lr=train_lr, betas=adam_betas)
         
-        if self.accelerator.is_main_process:
-            self.results_folder = Path(results_folder)
-            self.results_folder.mkdir(exist_ok = True)
+        # if self.accelerator.is_main_process:
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok = True)
 
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        # self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
         # accelerator tracking
-        if self.with_tracking:
-            run = os.path.split(__file__)[-1].split(".")[0]
-            self.accelerator.init_trackers(run, config={
-                'train_lr':train_lr,
-                'train_batch_size':train_batch_size,
-                'gradient_accumulate_every':gradient_accumulate_every,
-                'train_num_steps':train_num_steps,
-            })
+        # if self.with_tracking:
+        #     run = os.path.split(__file__)[-1].split(".")[0]
+        #     self.accelerator.init_trackers(run, config={
+        #         'train_lr':train_lr,
+        #         'train_batch_size':train_batch_size,
+        #         'gradient_accumulate_every':gradient_accumulate_every,
+        #         'train_num_steps':train_num_steps,
+        #     })
 
 
 
     def save(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
+        # if not self.accelerator.is_local_main_process:
+        #     return
 
         data = {
             'step': self.step,
-            'model': self.accelerator.get_state_dict(self.model),
+            'model': self.model.get_state_dict(),
             'opt': self.opt.state_dict(),
-            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
+            # 'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            'scaler' : None
         }
 
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone):
-        if not self.accelerator.is_local_main_process:
-            return
+        # if not self.accelerator.is_local_main_process:
+        #     return
             
-        accelerator = self.accelerator
-        device = accelerator.device
+        # accelerator = self.accelerator
+        # device = accelerator.device
+        device = torch.device('hpu')
 
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
 
-        model = self.accelerator.unwrap_model(self.model)
+        # model = self.accelerator.unwrap_model(self.model)
+        model = self.model
         model.load_state_dict(data['model'])
 
         self.step = data['step']
         self.opt.load_state_dict(data['opt'])
 
-        if exists(self.accelerator.scaler) and exists(data['scaler']):
-            self.accelerator.scaler.load_state_dict(data['scaler'])
+        # if exists(self.accelerator.scaler) and exists(data['scaler']):
+        #     self.accelerator.scaler.load_state_dict(data['scaler'])
 
 
     def on_train_step(self):
@@ -132,49 +141,91 @@ class Trainer(object):
     def on_evaluate_step(self):
         raise NotImplementedError('not implemeted')
 
+    def track_grad(self):
+        raise NotImplementedError('not implemeted')
+
     def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
-        
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
-            while self.step < self.train_num_steps:
+        if USE_PROFILE:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            activities.append(torch.profiler.ProfilerActivity.HPU)
 
-                total_loss = 0.
+            # prof = profile(activities=[ProfilerActivity.CUDA], with_stack=True)
 
-                for _ in range(self.gradient_accumulate_every):
+            prof = profile(
+                # schedule=torch.profiler.schedule(wait=0, warmup=20, active=5, repeat=1),
+                activities=activities,
+                # record_shapes=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_logs_1229'),
+                # profile_memory=True,
+                with_stack=True)
+        else:
+            prof = contextlib.nullcontext()
 
-                    with self.accelerator.autocast():
-                        loss, log_dict = self.on_train_step()
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss
+        # accelerator = self.accelerator
+        # device = accelerator.device
+        # print("device is : ", device)
 
-                    self.accelerator.backward(loss)
+        with prof:
+            with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
 
-                # all reduce to get the total loss
-                total_loss = accelerator.reduce(total_loss)
-                total_loss = total_loss.item()
-                log_str = f'loss: {total_loss:.3f}'
-                
-                for k in log_dict.keys():
-                    log_str += " {}: {:.3f}".format(k, log_dict[k])
-                
-                pbar.set_description(log_str)
+                while self.step < self.train_num_steps:
 
-                self.opt.step()
-                self.opt.zero_grad()
+                    total_loss = 0.
 
-                self.step += 1
-                if accelerator.is_main_process:
+                    for _ in range(self.gradient_accumulate_every):
+                        # Profile the training step
+                        with record_function("train_step"):
+                            # with self.accelerator.autocast():
+                            loss, log_dict = self.on_train_step()
+                            loss = loss / self.gradient_accumulate_every
+                            total_loss += loss
+                            # self.on_evaluate_step()
+
+                        with record_function("backward"):
+                            loss.backward()
+                            # htcore.mark_step()
+
+                            # Print parameter gradients
+                            print("Gradients:")
+                            for name, param in self.model.named_parameters():
+                                if param.grad is not None:
+                                    print(f"{name}: {torch.abs(param.grad).max()}")
+                                else:
+                                    print(f"{name}: No gradient calculated")
+                                # print(name, tensor.shape)
+
+                            debug = True
+                            if debug:
+                                self.track_grad()
+
+                    # all reduce to get the total loss
+                    # total_loss = accelerator.reduce(total_loss)
+                    total_loss = total_loss.item()
+                    log_str = f'loss: {total_loss:.3f}'
                     
+                    for k in log_dict.keys():
+                        log_str += " {}: {:.3f}".format(k, log_dict[k])
+                    
+                    pbar.set_description(log_str)
+
+                    with record_function("optimizer_step"):
+                        self.opt.step()
+                        # htcore.mark_step()
+                        self.opt.zero_grad()
+
+                    self.step += 1
+                    # if accelerator.is_main_process:
+                        
                     if (self.step % self.i_image == 0):
-                        self.on_evaluate_step()
+                        with record_function("evaluation"):
+                            self.on_evaluate_step()
 
                     if self.step !=0 and (self.step % self.i_save == 0):
                         milestone = self.step // self.i_save
                         self.save(milestone)
-                
-                pbar.update(1)
-
-        if self.with_tracking:
-            accelerator.end_training()
+                    
+                    pbar.update(1)
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        # if self.with_tracking:
+        #     accelerator.end_training()

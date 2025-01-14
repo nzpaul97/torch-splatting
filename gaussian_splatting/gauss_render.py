@@ -20,7 +20,7 @@ def build_rotation(r):
 
     q = r / norm[:, None]
 
-    R = torch.zeros((q.size(0), 3, 3), device='cuda')
+    R = torch.zeros((q.size(0), 3, 3), device='hpu')
 
     r = q[:, 0]
     x = q[:, 1]
@@ -41,7 +41,7 @@ def build_rotation(r):
 
 
 def build_scaling_rotation(s, r):
-    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
+    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="hpu")
     R = build_rotation(r)
 
     L[:,0,0] = s[:,0]
@@ -53,7 +53,7 @@ def build_scaling_rotation(s, r):
 
 
 def strip_lowerdiag(L):
-    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
+    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="hpu")
     uncertainty[:, 0] = L[:, 0, 0]
     uncertainty[:, 1] = L[:, 0, 1]
     uncertainty[:, 2] = L[:, 0, 2]
@@ -155,12 +155,13 @@ class GaussRenderer(nn.Module):
     >>> out = gaussRender(pc=gaussModel, camera=camera)
     """
 
-    def __init__(self, active_sh_degree=3, white_bkgd=True, **kwargs):
+    def __init__(self, active_sh_degree=3, white_bkgd=True,device="hpu", **kwargs):
         super(GaussRenderer, self).__init__()
         self.active_sh_degree = active_sh_degree
         self.debug = False
         self.white_bkgd = white_bkgd
-        self.pix_coord = torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).to('cuda')
+        self.device = device
+        self.pix_coord = torch.stack(torch.meshgrid(torch.arange(256), torch.arange(256), indexing='xy'), dim=-1).to(self.device)
         
     
     def build_color(self, means3D, shs, camera):
@@ -169,47 +170,99 @@ class GaussRenderer(nn.Module):
         color = eval_sh(self.active_sh_degree, shs.permute(0,2,1), rays_d)
         color = (color + 0.5).clip(min=0.0)
         return color
+
+    def cal_gauss_weight(self, dx, sorted_conic):
+        gauss_weight = torch.exp(-0.5 * (
+            dx[:, :, 0]**2 * sorted_conic[:, 0, 0] 
+            + dx[:, :, 1]**2 * sorted_conic[:, 1, 1]
+            + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 0, 1]
+            + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 1, 0]))
+
+        return gauss_weight
+
+    def cal_color_depth(self, gauss_weight, sorted_opacity, sorted_color, sorted_depths):
+        alpha = (gauss_weight[..., None] * sorted_opacity[None]).clip(max=0.99) # B P 1
+        T = torch.cat([torch.ones_like(alpha[:,:1]), 1-alpha[:,:-1]], dim=1).cumprod(dim=1)
+        acc_alpha = (alpha * T).sum(dim=1)
+        tile_color = (T * alpha * sorted_color[None]).sum(dim=1) + (1-acc_alpha) * (1 if self.white_bkgd else 0)
+        tile_depth = ((T * alpha) * sorted_depths[None,:,None]).sum(dim=1)
+
+        return acc_alpha, tile_color, tile_depth
+
+    def cal_in_mask(self, rect, w, h, TILE_SIZE):
+        over_tl = rect[0][..., 0].clip(min=w), rect[0][..., 1].clip(min=h)
+        over_br = rect[1][..., 0].clip(max=w+TILE_SIZE-1), rect[1][..., 1].clip(max=h+TILE_SIZE-1)
+        in_mask = (over_br[0] > over_tl[0]) & (over_br[1] > over_tl[1]) # 3D gaussian in the tile 
+
+        return in_mask
+
+    def cal_sorted_depth(self, depths, in_mask, h, w, TILE_SIZE):
+        P = in_mask.sum()
+        tile_coord = self.pix_coord[h:h+TILE_SIZE, w:w+TILE_SIZE].flatten(0,-2)
+        sorted_depths, index = torch.sort(depths[in_mask])
+
+        return tile_coord, sorted_depths, index
+
+    def cal_sorted_param(self, means2D, cov2d, opacity, color, in_mask, index):
+        sorted_means2D = means2D[in_mask][index]
+        sorted_cov2d = cov2d[in_mask][index] # P 2 2
+        sorted_conic = sorted_cov2d.inverse() # inverse of variance
+        sorted_opacity = opacity[in_mask][index]
+        sorted_color = color[in_mask][index]
+
+        return sorted_means2D, sorted_cov2d, sorted_conic, sorted_opacity, sorted_color
     
     def render(self, camera, means2D, cov2d, color, opacity, depths):
+        # print("100th point cloud 2D position gradient : ", means2D.grad[100])
         radii = get_radius(cov2d)
         rect = get_rect(means2D, radii, width=camera.image_width, height=camera.image_height)
         
-        self.render_color = torch.ones(*self.pix_coord.shape[:2], 3).to('cuda')
-        self.render_depth = torch.zeros(*self.pix_coord.shape[:2], 1).to('cuda')
-        self.render_alpha = torch.zeros(*self.pix_coord.shape[:2], 1).to('cuda')
+        self.render_color = torch.ones(*self.pix_coord.shape[:2], 3).to(self.device)
+        self.render_depth = torch.zeros(*self.pix_coord.shape[:2], 1).to(self.device)
+        self.render_alpha = torch.zeros(*self.pix_coord.shape[:2], 1).to(self.device)
 
         TILE_SIZE = 64
         for h in range(0, camera.image_height, TILE_SIZE):
             for w in range(0, camera.image_width, TILE_SIZE):
                 # check if the rectangle penetrate the tile
-                over_tl = rect[0][..., 0].clip(min=w), rect[0][..., 1].clip(min=h)
-                over_br = rect[1][..., 0].clip(max=w+TILE_SIZE-1), rect[1][..., 1].clip(max=h+TILE_SIZE-1)
-                in_mask = (over_br[0] > over_tl[0]) & (over_br[1] > over_tl[1]) # 3D gaussian in the tile 
+                # over_tl = rect[0][..., 0].clip(min=w), rect[0][..., 1].clip(min=h)
+                # over_br = rect[1][..., 0].clip(max=w+TILE_SIZE-1), rect[1][..., 1].clip(max=h+TILE_SIZE-1)
+                # in_mask = (over_br[0] > over_tl[0]) & (over_br[1] > over_tl[1]) # 3D gaussian in the tile 
+
+                in_mask = self.cal_in_mask(rect, w, h, TILE_SIZE)
                 
                 if not in_mask.sum() > 0:
                     continue
 
-                P = in_mask.sum()
-                tile_coord = self.pix_coord[h:h+TILE_SIZE, w:w+TILE_SIZE].flatten(0,-2)
-                sorted_depths, index = torch.sort(depths[in_mask])
-                sorted_means2D = means2D[in_mask][index]
-                sorted_cov2d = cov2d[in_mask][index] # P 2 2
-                sorted_conic = sorted_cov2d.inverse() # inverse of variance
-                sorted_opacity = opacity[in_mask][index]
-                sorted_color = color[in_mask][index]
+                # P = in_mask.sum()
+                # tile_coord = self.pix_coord[h:h+TILE_SIZE, w:w+TILE_SIZE].flatten(0,-2)
+                # sorted_depths, index = torch.sort(depths[in_mask])
+                tile_coord, sorted_depths, index = self.cal_sorted_depth(depths, in_mask, h, w, TILE_SIZE)
+                
+                # sorted_means2D = means2D[in_mask][index]
+                # sorted_cov2d = cov2d[in_mask][index] # P 2 2
+                # sorted_conic = sorted_cov2d.inverse() # inverse of variance
+                # sorted_opacity = opacity[in_mask][index]
+                # sorted_color = color[in_mask][index]
+                sorted_means2D, sorted_cov2d, sorted_conic, sorted_opacity, sorted_color = self.cal_sorted_param(means2D, cov2d, opacity, color, in_mask, index)
+
                 dx = (tile_coord[:,None,:] - sorted_means2D[None,:]) # B P 2
                 
-                gauss_weight = torch.exp(-0.5 * (
-                    dx[:, :, 0]**2 * sorted_conic[:, 0, 0] 
-                    + dx[:, :, 1]**2 * sorted_conic[:, 1, 1]
-                    + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 0, 1]
-                    + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 1, 0]))
+                # gauss_weight = torch.exp(-0.5 * (
+                #     dx[:, :, 0]**2 * sorted_conic[:, 0, 0] 
+                #     + dx[:, :, 1]**2 * sorted_conic[:, 1, 1]
+                #     + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 0, 1]
+                #     + dx[:,:,0]*dx[:,:,1] * sorted_conic[:, 1, 0]))
+                gauss_weight = self.cal_gauss_weight(dx, sorted_conic)
                 
-                alpha = (gauss_weight[..., None] * sorted_opacity[None]).clip(max=0.99) # B P 1
-                T = torch.cat([torch.ones_like(alpha[:,:1]), 1-alpha[:,:-1]], dim=1).cumprod(dim=1)
-                acc_alpha = (alpha * T).sum(dim=1)
-                tile_color = (T * alpha * sorted_color[None]).sum(dim=1) + (1-acc_alpha) * (1 if self.white_bkgd else 0)
-                tile_depth = ((T * alpha) * sorted_depths[None,:,None]).sum(dim=1)
+                # alpha = (gauss_weight[..., None] * sorted_opacity[None]).clip(max=0.99) # B P 1
+                # T = torch.cat([torch.ones_like(alpha[:,:1]), 1-alpha[:,:-1]], dim=1).cumprod(dim=1)
+                # acc_alpha = (alpha * T).sum(dim=1)
+                # tile_color = (T * alpha * sorted_color[None]).sum(dim=1) + (1-acc_alpha) * (1 if self.white_bkgd else 0)
+                # tile_depth = ((T * alpha) * sorted_depths[None,:,None]).sum(dim=1)
+
+                acc_alpha, tile_color, tile_depth = self.cal_color_depth(gauss_weight, sorted_opacity, sorted_color, sorted_depths)
+
                 self.render_color[h:h+TILE_SIZE, w:w+TILE_SIZE] = tile_color.reshape(TILE_SIZE, TILE_SIZE, -1)
                 self.render_depth[h:h+TILE_SIZE, w:w+TILE_SIZE] = tile_depth.reshape(TILE_SIZE, TILE_SIZE, -1)
                 self.render_alpha[h:h+TILE_SIZE, w:w+TILE_SIZE] = acc_alpha.reshape(TILE_SIZE, TILE_SIZE, -1)
@@ -224,6 +277,7 @@ class GaussRenderer(nn.Module):
 
 
     def forward(self, camera, pc, **kwargs):
+        print("forward 100th point cloud position : ", pc._xyz[100].tolist())
         means3D = pc.get_xyz
         opacity = pc.get_opacity
         scales = pc.get_scaling
