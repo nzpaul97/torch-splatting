@@ -19,6 +19,8 @@ Tile-based rendering is implemeted. Because running loop for python is slow, it 
 
 Still does not work properly on GAUDI V2
 
+While calculating gradients for each parameter, it throws an synNodeCreateWithId failed error.
+
 
 ## Reference
 
